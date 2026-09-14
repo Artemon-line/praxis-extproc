@@ -6,7 +6,7 @@
 
 //! Binary entry point for the Praxis ExtProc server.
 
-use std::process;
+use std::{future::Future, process};
 
 use clap::Parser;
 use praxis_extproc::{
@@ -72,42 +72,74 @@ async fn main() {
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let cfg = load_config(&cli.config)?;
     let registry = praxis_ai_filters::build_ai_registry();
-    let pipeline = config::build_pipeline(&cfg, &registry)?;
+    let pipeline = config::build_pipeline(&cfg, &registry);
 
     if cli.validate {
+        pipeline?;
         info!("configuration is valid");
         return Ok(());
     }
 
     let addrs = resolve_addresses(&cli, &cfg)?;
 
-    info!(
-        grpc = %addrs.0, health = %addrs.1,
-        metrics = %addrs.2, filters = pipeline.len(),
-        "starting ExtProc server"
-    );
-
-    Box::pin(start_services(addrs, pipeline, &cfg.server.tls)).await
+    match pipeline {
+        Ok(pipeline) => {
+            info!(
+                grpc = %addrs.0, health = %addrs.1,
+                metrics = %addrs.2, filters = pipeline.len(),
+                "starting ExtProc server"
+            );
+            Box::pin(start_services(addrs, pipeline, &cfg.server.tls)).await
+        },
+        Err(e) => {
+            error!(error = %e, health = %addrs.1, "filter pipeline build failed; reporting NotServing");
+            Box::pin(serve_unready(addrs)).await
+        },
+    }
 }
 
-/// Start gRPC, health, and metrics servers concurrently.
-#[expect(clippy::cognitive_complexity, reason = "async state machine for server startup")]
+/// Start gRPC, health (`Serving`), and metrics servers concurrently.
 async fn start_services(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
     tls_cfg: &tls::TlsConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    Box::pin(run_with_sidecars(addrs, true, serve_grpc(addrs.0, pipeline, tls_cfg))).await
+}
+
+/// Serve only health (`NotServing`) and metrics when the pipeline failed to
+/// build, keeping the process alive and inspectable until shutdown.
+async fn serve_unready(
+    addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
+) -> Result<(), Box<dyn std::error::Error>> {
+    Box::pin(run_with_sidecars(addrs, false, async {
+        shutdown_signal().await;
+        Ok(())
+    }))
+    .await
+}
+
+/// Run the health and metrics sidecars alongside a foreground future.
+///
+/// Health is registered as serving per `serving`; the sidecars are shut down
+/// once the foreground future completes.
+#[expect(clippy::cognitive_complexity, reason = "async state machine for server startup")]
+async fn run_with_sidecars(
+    addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
+    serving: bool,
+    foreground: impl Future<Output = Result<(), Box<dyn std::error::Error>>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
     let health_rx = shutdown_tx.subscribe();
     let health_handle =
-        tokio::spawn(async move { praxis_extproc::health::serve(addrs.1, wait_broadcast(health_rx)).await });
+        tokio::spawn(async move { praxis_extproc::health::serve(addrs.1, serving, wait_broadcast(health_rx)).await });
 
     let metrics_rx = shutdown_tx.subscribe();
     let metrics_handle =
         tokio::spawn(async move { praxis_extproc::metrics::serve(addrs.2, wait_broadcast(metrics_rx)).await });
 
-    serve_grpc(addrs.0, pipeline, tls_cfg).await?;
+    foreground.await?;
 
     drop(shutdown_tx);
 
