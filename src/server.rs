@@ -1778,4 +1778,63 @@ mod tests {
             "clearing the body must declare content-length: 0"
         );
     }
+
+    /// Run `f` under a thread-local recorder and return the value of the
+    /// `invalid_argument_total` counter matching `reason`/`detail` (0 if absent).
+    fn invalid_arg_count(reason: &str, detail: &str, f: impl FnOnce()) -> u64 {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        {
+            // `::metrics` disambiguates the external crate from this crate's `metrics` module.
+            let _guard = ::metrics::set_default_local_recorder(&recorder);
+            f();
+        }
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(composite, _unit, _desc, value)| {
+                let key = composite.key();
+                let matches = key.name() == "praxis_extproc_invalid_argument_total"
+                    && key.labels().any(|l| l.key() == "reason" && l.value() == reason)
+                    && key.labels().any(|l| l.key() == "detail" && l.value() == detail);
+                match value {
+                    DebugValue::Counter(count) if matches => Some(count),
+                    _ => None,
+                }
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn apply_protocol_config_after_first_message_records_metric() {
+        let mut state = StreamState::new();
+        let count = invalid_arg_count("protocol_config", "after_first_message", || {
+            let result = apply_protocol_config(&mut state, Some(ProtocolConfiguration::default()), true);
+            assert!(
+                matches!(&result, Err(status) if status.code() == tonic::Code::InvalidArgument),
+                "late protocol_config must be rejected with invalid_argument"
+            );
+        });
+        assert_eq!(count, 1, "late delivery must increment after_first_message");
+    }
+
+    #[test]
+    fn config_from_first_message_unsupported_mode_records_metric() {
+        let mut state = StreamState::new();
+        // 3 == BUFFERED_PARTIAL, an unsupported body mode.
+        let bad = ProtocolConfiguration {
+            request_body_mode: 3,
+            ..ProtocolConfiguration::default()
+        };
+        let count = invalid_arg_count("protocol_config", "unsupported_mode", || {
+            assert!(
+                config_from_first_message(&mut state, bad).is_err(),
+                "unsupported mode must be rejected"
+            );
+        });
+        assert_eq!(count, 1, "unsupported mode must increment unsupported_mode");
+    }
 }
