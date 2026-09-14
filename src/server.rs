@@ -1779,10 +1779,35 @@ mod tests {
         );
     }
 
-    /// Run `f` under a thread-local recorder and return the value of the
-    /// `invalid_argument_total` counter matching `reason`/`detail` (0 if absent).
-    fn invalid_arg_count(reason: &str, detail: &str, f: impl FnOnce()) -> u64 {
-        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    /// Value of the counter `name` carrying every `labels` pair (0 if absent).
+    fn snapshot_counter(
+        snapshotter: &metrics_util::debugging::Snapshotter,
+        name: &str,
+        labels: &[(&str, &str)],
+    ) -> u64 {
+        use metrics_util::debugging::DebugValue;
+
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(composite, _unit, _desc, value)| {
+                let key = composite.key();
+                let matches = key.name() == name
+                    && labels
+                        .iter()
+                        .all(|(k, v)| key.labels().any(|l| l.key() == *k && l.value() == *v));
+                match value {
+                    DebugValue::Counter(count) if matches => Some(count),
+                    _ => None,
+                }
+            })
+            .unwrap_or(0)
+    }
+
+    /// Run sync `f` under a thread-local recorder and read back counter `name`/`labels`.
+    fn counter_value(name: &str, labels: &[(&str, &str)], f: impl FnOnce()) -> u64 {
+        use metrics_util::debugging::DebuggingRecorder;
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
@@ -1791,21 +1816,16 @@ mod tests {
             let _guard = ::metrics::set_default_local_recorder(&recorder);
             f();
         }
-        snapshotter
-            .snapshot()
-            .into_vec()
-            .into_iter()
-            .find_map(|(composite, _unit, _desc, value)| {
-                let key = composite.key();
-                let matches = key.name() == "praxis_extproc_invalid_argument_total"
-                    && key.labels().any(|l| l.key() == "reason" && l.value() == reason)
-                    && key.labels().any(|l| l.key() == "detail" && l.value() == detail);
-                match value {
-                    DebugValue::Counter(count) if matches => Some(count),
-                    _ => None,
-                }
-            })
-            .unwrap_or(0)
+        snapshot_counter(&snapshotter, name, labels)
+    }
+
+    /// Count `invalid_argument_total` increments matching `reason`/`detail` while `f` runs.
+    fn invalid_arg_count(reason: &str, detail: &str, f: impl FnOnce()) -> u64 {
+        counter_value(
+            "praxis_extproc_invalid_argument_total",
+            &[("reason", reason), ("detail", detail)],
+            f,
+        )
     }
 
     #[test]
@@ -1836,5 +1856,130 @@ mod tests {
             );
         });
         assert_eq!(count, 1, "unsupported mode must increment unsupported_mode");
+    }
+
+    #[test]
+    fn phase_order_response_before_request_headers_records_metric() {
+        use praxis_proto::envoy::service::ext_proc::v3::HttpHeaders;
+        use processing_request::Request;
+
+        let mut tracker = PhaseOrderTracker::default();
+        let count = invalid_arg_count("message_order", "response_before_request_headers", || {
+            assert!(
+                tracker
+                    .check_and_advance(&Request::ResponseHeaders(HttpHeaders::default()))
+                    .is_err(),
+                "response before request headers must be rejected"
+            );
+        });
+        assert_eq!(count, 1, "response-before-request-headers must increment the counter");
+    }
+
+    #[test]
+    fn phase_order_invalid_transition_records_metric() {
+        use praxis_proto::envoy::service::ext_proc::v3::{HttpBody, HttpHeaders, HttpTrailers};
+        use processing_request::Request;
+
+        let mut tracker = PhaseOrderTracker::default();
+        assert!(
+            tracker
+                .check_and_advance(&Request::RequestHeaders(HttpHeaders::default()))
+                .is_ok()
+        );
+        assert!(
+            tracker
+                .check_and_advance(&Request::RequestTrailers(HttpTrailers::default()))
+                .is_ok()
+        );
+
+        let count = invalid_arg_count("message_order", "invalid_phase_transition", || {
+            assert!(
+                tracker
+                    .check_and_advance(&Request::RequestBody(HttpBody::default()))
+                    .is_err(),
+                "RequestBody after RequestTrailers must be rejected"
+            );
+        });
+        assert_eq!(count, 1, "invalid phase transition must increment the counter");
+    }
+
+    #[test]
+    fn eos_body_after_headers_records_metric() {
+        let mut tracker = EosTracker::default();
+        assert!(tracker.check_and_mark(ProtocolPhase::RequestHeaders, true).is_ok());
+
+        let count = invalid_arg_count("message_order", "body_after_headers_eos", || {
+            assert!(
+                tracker.check_and_mark(ProtocolPhase::RequestBody, true).is_err(),
+                "body after headers EOS must be rejected"
+            );
+        });
+        assert_eq!(count, 1, "body-after-headers-eos must increment the counter");
+    }
+
+    #[test]
+    fn duplicate_after_eos_records_metric() {
+        let count = invalid_arg_count("duplicate_eos", "redelivery", || {
+            let err = duplicate_after_eos(ProtocolPhase::RequestBody);
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        });
+        assert_eq!(count, 1, "duplicate-eos redelivery must increment the counter");
+    }
+
+    #[test]
+    fn check_body_limit_rejection_records_metric() {
+        let count = counter_value("praxis_extproc_body_size_rejections_total", &[], || {
+            assert!(
+                check_body_limit(MAX_BODY_ACCUMULATION, 1).is_err(),
+                "exceeding the body limit must be rejected"
+            );
+        });
+        assert_eq!(count, 1, "body-size rejection must increment the counter");
+    }
+
+    #[tokio::test]
+    async fn run_request_pipeline_missing_headers_records_metric() {
+        use praxis_filter::FilterRegistry;
+
+        let pipeline = FilterPipeline::build(&mut [], &FilterRegistry::with_builtins()).unwrap();
+        let mut state = StreamState::new();
+
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        {
+            let _guard = ::metrics::set_default_local_recorder(&recorder);
+            let result = run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state).await;
+            assert!(result.is_err(), "missing request headers must be rejected");
+        }
+        let count = snapshot_counter(
+            &snapshotter,
+            "praxis_extproc_invalid_argument_total",
+            &[("reason", "missing_headers"), ("detail", "request")],
+        );
+        assert_eq!(count, 1, "missing request headers must increment the counter");
+    }
+
+    #[tokio::test]
+    async fn run_response_pipeline_missing_response_headers_records_metric() {
+        use praxis_filter::FilterRegistry;
+
+        let pipeline = FilterPipeline::build(&mut [], &FilterRegistry::with_builtins()).unwrap();
+        let mut state = StreamState::new();
+        // Request headers present, response headers absent: isolates the response branch.
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        {
+            let _guard = ::metrics::set_default_local_recorder(&recorder);
+            let result = run_response_pipeline(ResponsePhase::Headers, &pipeline, &mut state).await;
+            assert!(result.is_err(), "missing response headers must be rejected");
+        }
+        let count = snapshot_counter(
+            &snapshotter,
+            "praxis_extproc_invalid_argument_total",
+            &[("reason", "missing_headers"), ("detail", "response")],
+        );
+        assert_eq!(count, 1, "missing response headers must increment the counter");
     }
 }
