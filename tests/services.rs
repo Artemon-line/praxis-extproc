@@ -66,8 +66,13 @@ async fn health_check_responds_serving() {
 
     let mut client = tonic_health::pb::health_client::HealthClient::new(channel);
 
+    let service = <praxis_proto::envoy::service::ext_proc::v3::external_processor_server::ExternalProcessorServer<
+        praxis_extproc::server::PraxisExtProc,
+    > as tonic::server::NamedService>::NAME
+        .to_owned();
+
     let resp = client
-        .check(tonic_health::pb::HealthCheckRequest { service: String::new() })
+        .check(tonic_health::pb::HealthCheckRequest { service })
         .await
         .expect("health check should succeed");
 
