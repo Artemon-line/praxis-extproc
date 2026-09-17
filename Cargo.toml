@@ -16,6 +16,7 @@ path = "src/bin/praxis_extproc.rs"
 [features]
 integration = []
 k8s-e2e = []
+fips = []
 
 [dependencies]
 async-trait = "0.1.89"
