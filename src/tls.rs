@@ -301,6 +301,8 @@ async fn perform_handshake(
     acceptor: Arc<SslAcceptor>,
 ) -> Result<OpenSslStream, io::Error> {
     let stream = result?;
+    // Disable Nagle. tonic's TCP_NODELAY does not reach this stream.
+    stream.set_nodelay(true)?;
     let local_addr = stream.local_addr().ok();
     let remote_addr = stream.peer_addr().ok();
     let ssl = Ssl::new(acceptor.context()).map_err(io::Error::other)?;
@@ -390,7 +392,8 @@ fn set_alpn_h2(builder: &mut SslAcceptorBuilder) -> crate::error::Result<()> {
     builder
         .set_alpn_protos(b"\x02h2")
         .map_err(|e| crate::error::ExtProcError::Config(format!("ALPN protos: {e}")))?;
-    builder.set_alpn_select_callback(|_ssl, client| select_next_proto(b"\x02h2", client).ok_or(AlpnError::NOACK));
+    // Fail the handshake on missing h2 rather than deferring to an opaque error.
+    builder.set_alpn_select_callback(|_ssl, client| select_next_proto(b"\x02h2", client).ok_or(AlpnError::ALERT_FATAL));
     Ok(())
 }
 
