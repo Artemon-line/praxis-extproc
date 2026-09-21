@@ -99,9 +99,11 @@ async fn tool_call_passthrough() {
     assert_eq!(resp.status(), 200);
 
     let body: serde_json::Value = resp.json().await.expect("failed to parse JSON");
-    // Dual-format validation: Handles both Anthropic Messages and OpenAI ChatCompletions responses.
-    // Note: The E2E mock simulator (llm-d-inference-sim in echo mode) echoes text blocks rather than generating actual
-    // tool calls.
+    tracing::debug!(
+        "dual-format validation: handles both Anthropic Messages and OpenAI \
+         ChatCompletions responses; E2E mock simulator echoes text blocks \
+         rather than generating actual tool calls"
+    );
     if let Some(choices) = body.get("choices") {
         let msg = choices[0]["message"].as_object().unwrap();
         assert!(
